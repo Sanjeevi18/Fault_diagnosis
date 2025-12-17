@@ -1,46 +1,62 @@
 import 'dart:convert';
+import 'dart:async'; // Required for Timer
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:get/get.dart';
-import '../model/error_model.dart'; // Ensure this path matches your project structure
+import '../model/error_model.dart';
 
 class ErrorController extends GetxController {
-  // Master list of ALL data
   var _allErrors = <ErrorCode>[];
-
-  // List currently displayed in the UI (Observable)
   var displayedErrors = <ErrorCode>[].obs;
 
+  // Memoized list to avoid re-filtering during scroll
+  List<ErrorCode> _currentFilteredList = [];
+
   var isLoading = true.obs;
-  var isLoadingMore = false.obs; // For the bottom loader
+  var isLoadingMore = false.obs;
 
-  // Pagination variables
   int _currentPage = 0;
-  final int _itemsPerPage = 20;
-
-  // Scroll Controller for the ListView
+  final int _itemsPerPage = 15; // Reduced for faster initial load
   final ScrollController scrollController = ScrollController();
 
-  // Search Query tracker
   String _currentQuery = '';
+  var selectedCategory = 'All'.obs;
+
+  Timer? _debounce; // For search efficiency
+
+  final List<String> categories = [
+    'All', // Default selected
+    'PIM 50',
+    'ROM 50',
+    'PM',
+    'LOM 110',
+    'Common Negation errors',
+  ];
 
   @override
   void onInit() {
     super.onInit();
     loadDatabase();
+    scrollController.addListener(_scrollListener);
+  }
 
-    // Listener for Lazy Loading (Infinite Scroll)
-    scrollController.addListener(() {
-      if (scrollController.position.pixels ==
-          scrollController.position.maxScrollExtent) {
-        // User reached bottom, load more
-        loadMoreData();
-      }
-    });
+  void _scrollListener() {
+    // Enhanced lazy loading with better threshold
+    if (scrollController.position.pixels >=
+        scrollController.position.maxScrollExtent - 300) {
+      loadMoreData();
+    }
+
+    // Preload when user is 80% through current content
+    if (scrollController.position.pixels >=
+        scrollController.position.maxScrollExtent * 0.8) {
+      _preloadNextChunk();
+    }
   }
 
   @override
   void onClose() {
+    _debounce?.cancel();
     scrollController.dispose();
     super.onClose();
   }
@@ -52,82 +68,91 @@ class ErrorController extends GetxController {
         'assets/database.json',
       );
       final List<dynamic> data = json.decode(response);
-
-      // Store everything in the master list
       _allErrors = data.map((e) => ErrorCode.fromJson(e)).toList();
-
-      // Initial load of the displayed list
-      resetList();
+      applyFilters();
     } catch (e) {
-      print("Error loading database: $e");
       Get.snackbar("Error", "Could not load error database.");
     } finally {
       isLoading.value = false;
     }
   }
 
-  // Resets the list to the first page (used on Init and Clear Search)
-  void resetList() {
-    _currentQuery = '';
+  void searchError(String query) {
+    // Debounce search to save CPU cycles
+    if (_debounce?.isActive ?? false) _debounce!.cancel();
+    _debounce = Timer(const Duration(milliseconds: 300), () {
+      _currentQuery = query;
+      _resetPagination();
+    });
+  }
+
+  void setCategory(String? category) {
+    selectedCategory.value = category ?? 'All';
+    _resetPagination();
+  }
+
+  void _resetPagination() {
     _currentPage = 0;
     displayedErrors.clear();
-    _loadNextChunk(_allErrors);
+    applyFilters();
   }
 
-  // Search Logic
-  void searchError(String query) {
-    _currentQuery = query;
-    _currentPage = 0; // Reset pagination for new search
-    displayedErrors.clear();
+  void applyFilters() {
+    // Filter once and store in _currentFilteredList
+    _currentFilteredList = _allErrors.where((error) {
+      bool matchesCategory =
+          selectedCategory.value == 'All' ||
+          error.category == selectedCategory.value;
+      bool matchesQuery =
+          _currentQuery.isEmpty ||
+          error.code.toLowerCase().contains(_currentQuery.toLowerCase());
+      return matchesCategory && matchesQuery;
+    }).toList();
 
-    if (query.isEmpty) {
-      // If search is cleared, go back to showing the full list (paginated)
-      resetList();
-    } else {
-      // Filter the master list
-      List<ErrorCode> results = _allErrors.where((error) {
-        return error.code.toLowerCase().contains(query.toLowerCase());
-      }).toList();
-
-      // Load the first chunk of the search results
-      _loadNextChunk(results);
-    }
+    _loadNextChunk();
   }
 
-  // The actual "Lazy Load" logic triggered by scrolling
   void loadMoreData() {
-    if (isLoadingMore.value) return;
+    if (isLoadingMore.value ||
+        displayedErrors.length >= _currentFilteredList.length)
+      return;
+    _loadNextChunk();
+  }
 
-    // Determine which list we are paginating (Full list or Search Results)
-    List<ErrorCode> sourceList;
-    if (_currentQuery.isEmpty) {
-      sourceList = _allErrors;
-    } else {
-      sourceList = _allErrors.where((error) {
-        return error.code.toLowerCase().contains(_currentQuery.toLowerCase());
-      }).toList();
-    }
+  void _preloadNextChunk() {
+    // Silently preload next chunk when user is near bottom
+    if (!isLoadingMore.value &&
+        displayedErrors.length < _currentFilteredList.length) {
+      int nextStart = (_currentPage) * _itemsPerPage;
+      int nextEnd = nextStart + (_itemsPerPage ~/ 2); // Preload half chunk
 
-    if (displayedErrors.length < sourceList.length) {
-      _loadNextChunk(sourceList);
+      if (nextEnd > _currentFilteredList.length) {
+        nextEnd = _currentFilteredList.length;
+      }
+
+      if (nextStart < _currentFilteredList.length) {
+        Future.delayed(const Duration(milliseconds: 50), () {
+          displayedErrors.addAll(
+            _currentFilteredList.sublist(nextStart, nextEnd),
+          );
+        });
+      }
     }
   }
 
-  // Helper to slice the list and append data
-  void _loadNextChunk(List<ErrorCode> source) async {
+  void _loadNextChunk() async {
+    if (isLoadingMore.value) return;
     isLoadingMore.value = true;
 
-    // Simulate a tiny delay for visual effect (optional, remove in production if unwanted)
-    await Future.delayed(const Duration(milliseconds: 300));
+    await Future.delayed(const Duration(milliseconds: 100));
 
     int start = _currentPage * _itemsPerPage;
     int end = start + _itemsPerPage;
 
-    // Boundary check
-    if (end > source.length) end = source.length;
+    if (end > _currentFilteredList.length) end = _currentFilteredList.length;
 
-    if (start < source.length) {
-      displayedErrors.addAll(source.sublist(start, end));
+    if (start < _currentFilteredList.length) {
+      displayedErrors.addAll(_currentFilteredList.sublist(start, end));
       _currentPage++;
     }
 
